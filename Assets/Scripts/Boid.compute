@@ -1,0 +1,68 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct BoidData
+{
+    float3 Position;
+    float3 Heading;
+};
+
+struct BoidResult
+{
+    float3 Heading;
+};
+
+// INPUT VARIABLES
+float AlignmentCoefficient;
+float CohesionCoefficient;
+float SeparationCoefficient;
+
+float MaxViewDistanceSquared;
+
+int BoidCount;
+StructuredBuffer<BoidData> Boids;
+// END INPUT VARIABLES
+
+RWStructuredBuffer<BoidResult> Result;
+
+[numthreads(512,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float3 alignment = Boids[id.x].Heading;
+    float3 separation = float3(0,0,0);
+    float3 cohesionCenter = Boids[id.x].Position;
+
+    int flockCount = 1;
+    
+    for (int otherIndex = 0; otherIndex < BoidCount; otherIndex++)
+    {
+        if (id.x == otherIndex) continue;
+
+        const BoidData otherBoid = Boids[otherIndex];
+        const float3 otherToSelf = Boids[id.x].Position - otherBoid.Position;
+        const float sqrDistance = pow(otherToSelf.x, 2) + pow(otherToSelf.y, 2) + pow(otherToSelf.z, 2);
+        if (sqrDistance <= MaxViewDistanceSquared)
+        {
+            const float inverseDistanceFactor = 1 - (sqrDistance / MaxViewDistanceSquared);
+            alignment += otherBoid.Heading * inverseDistanceFactor;
+            separation += normalize(otherToSelf) * inverseDistanceFactor;
+            cohesionCenter += otherBoid.Position;
+            flockCount++;
+        }
+    }
+
+    cohesionCenter /= flockCount;
+    float3 cohesion = normalize(cohesionCenter - Boids[id.x].Position) * CohesionCoefficient;
+    if ((int)isnan(cohesion))
+    {
+        cohesion = float3(0,0,0);
+    }
+    alignment = normalize(alignment / flockCount) * AlignmentCoefficient;
+    separation = normalize(separation / flockCount) * SeparationCoefficient;
+    if ((int)isnan(separation))
+    {
+        separation = float3(0,0,0);
+    }
+
+    Result[id.x].Heading = normalize(cohesion + alignment + separation);
+}

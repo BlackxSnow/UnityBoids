@@ -332,10 +332,10 @@ MonoBehaviour:
   _BoidPrefab: {fileID: 4316687954337169298, guid: 6db1dfb590135c542b789d25c6fd1985, type: 3}
   ViewDistance: 5
   AlignmentCoefficient: 1
-  CohesionCoefficient: 1
-  SeparationCoefficient: 1
-  InitialBoidCount: 4096
-  MaxWanderRange: 32
+  CohesionCoefficient: 2
+  SeparationCoefficient: 2
+  InitialBoidCount: 8192
+  MaxWanderRange: 50
   BoidSpeed: 3
 --- !u!4 &1773326724
 Transform:

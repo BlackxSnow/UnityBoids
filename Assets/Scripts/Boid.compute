@@ -19,6 +19,9 @@ float SeparationCoefficient;
 
 float MaxViewDistanceSquared;
 
+float3 FlockOrigin;
+float MaxWanderDistanceSquared;
+
 int BoidCount;
 StructuredBuffer<BoidData> Boids;
 // END INPUT VARIABLES
@@ -64,5 +67,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         separation = float3(0,0,0);
     }
 
-    Result[id.x].Heading = normalize(cohesion + alignment + separation);
+    const float3 toOrigin = FlockOrigin - Boids[id.x].Position;
+    const float originSqrDisplacement = pow(toOrigin.x, 2) + pow(toOrigin.y, 2) + pow(toOrigin.z, 2);
+    const float turnStartDistance = MaxWanderDistanceSquared * 0.9;
+    const float turnFactor = clamp((originSqrDisplacement - turnStartDistance) / (MaxWanderDistanceSquared - turnStartDistance),0,1);
+    
+    Result[id.x].Heading = lerp(normalize(cohesion + alignment + separation), normalize(toOrigin), turnFactor);
 }

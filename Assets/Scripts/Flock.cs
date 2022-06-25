@@ -5,9 +5,12 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Threading.Tasks;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using UnityEngine;
 using UnityEngine.Jobs;
+using UnityEngine.Rendering;
+using Yangrc.OpenGLAsyncReadback;
 
 namespace Boids
 {
@@ -22,32 +25,17 @@ namespace Boids
         /// </summary>
         private struct BoidData
         {
-            private readonly Vector3 Position;
-            private readonly Vector3 Heading;
+            public Vector3 Position;
+            public Vector3 Heading;
             public BoidData(Vector3 position, Vector3 heading)
             {
                 Position = position;
                 Heading = heading;
             }
         }
-
         private static readonly int _BoidDataSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(BoidData));
-        /// <summary>
-        /// Defines a single flock member.
-        /// </summary>
-        private struct Boid
-        {
-            public readonly Transform Transform;
-            public Vector3 Heading;
 
-            public Boid(Transform transform, Vector3 heading)
-            {
-                Transform = transform;
-                Heading = heading;
-            }
-        }
-        
-        
+
         private static List<Vector3> _CollisionRayDirections = new List<Vector3>();
         private static bool _IsInitialised = false;
 
@@ -79,13 +67,17 @@ namespace Boids
         public int MaxWanderRange = 32;
 
         public float BoidSpeed = 3;
+        
 
-        private List<Boid> _Boids = new List<Boid>();
-        private BoidData[] _BoidData;
+        private TransformAccessArray _BoidTransforms;
+        private NativeList<BoidData> _BoidData;
+        
+        private Vector3[] _GPUDataReadArray;
+        
 
         public void CreateBoids(int count)
         {
-            for (int i = 0; i < count; i++)
+            for (var i = 0; i < count; i++)
             {
                 Vector3 position = new Vector3()
                 {
@@ -93,37 +85,36 @@ namespace Boids
                     y = transform.position.x + UnityEngine.Random.Range(-20, 20),
                     z = transform.position.x + UnityEngine.Random.Range(-20, 20)
                 };
-                _Boids.Add(new Boid(Instantiate(_BoidPrefab, position, Quaternion.identity).transform, Vector3.forward));
+                _BoidTransforms.Add(Instantiate(_BoidPrefab, position, Quaternion.identity).transform);
+                _BoidData.Add(new BoidData(_BoidTransforms[i].position, Vector3.forward));
             }
 
-            _BoidData = new BoidData[_Boids.Count];
+            if (_GPUDataReadArray.Length < _BoidData.Capacity)
+            {
+                _GPUDataReadArray = new Vector3[_BoidData.Capacity];
+            }
         }
         
         private void Start()
         {
+            _BoidTransforms = new TransformAccessArray(InitialBoidCount);
+            _BoidData = new NativeList<BoidData>(InitialBoidCount);
+            _GPUDataReadArray = new Vector3[InitialBoidCount];
             CreateBoids(InitialBoidCount);
-        }
-
-        private void FillBoidDataArray()
-        {
-            for (var i = 0; i < _BoidData.Length; i++)
-            {
-                _BoidData[i] = new BoidData(_Boids[i].Transform.position, _Boids[i].Heading);
-            }
         }
         
         [SuppressMessage("ReSharper", "UseObjectOrCollectionInitializer")]
-        private void UpdateBoidData()
+        private void UpdateBoids()
         {
-            if (_Boids.Count == 0) return;
+            if (_BoidData.Count == 0) return;
             
             var kernelHandle = _BoidCompute.FindKernel("CSMain");
             
-            var inputBuffer = new ComputeBuffer(_Boids.Count, _BoidDataSize, 
+            var inputBuffer = new ComputeBuffer(_BoidData.Count, _BoidDataSize, 
                 ComputeBufferType.Structured, ComputeBufferMode.Immutable);
             
-            FillBoidDataArray();
-            inputBuffer.SetData(_BoidData);
+            
+            inputBuffer.SetData(_BoidData.UnderlyingArray);
 
             
             // _BoidCompute.SetConstantBuffer("Boids", inputBuffer, 0, _Boids.Count);
@@ -132,53 +123,59 @@ namespace Boids
             _BoidCompute.SetFloat("CohesionCoefficient", CohesionCoefficient);
             _BoidCompute.SetFloat("SeparationCoefficient", SeparationCoefficient);
             _BoidCompute.SetFloat("MaxViewDistanceSquared", Mathf.Pow(ViewDistance, 2));
-            _BoidCompute.SetInt("BoidCount", _Boids.Count);
+            _BoidCompute.SetFloat("MaxWanderDistanceSquared", Mathf.Pow(MaxWanderRange, 2));
+            _BoidCompute.SetVector("FlockOrigin", transform.position);
+            _BoidCompute.SetInt("BoidCount", _BoidData.Count);
 
-            var outputBuffer = new ComputeBuffer(_Boids.Count, 12 /*sizeof(Vector3)*/,
+            var outputBuffer = new ComputeBuffer(_BoidData.Count, 12 /*sizeof(Vector3)*/,
                 ComputeBufferType.Structured, ComputeBufferMode.Dynamic);
             _BoidCompute.SetBuffer(kernelHandle, "Result", outputBuffer);
             
-            _BoidCompute.Dispatch(kernelHandle, Mathf.CeilToInt((float)_Boids.Count / _ThreadCount), 1, 1);
+            _BoidCompute.Dispatch(kernelHandle, Mathf.CeilToInt((float)_BoidData.Count / _ThreadCount), 1, 1);
             inputBuffer.Dispose();
 
-            var newHeadings = new Vector3[_Boids.Count];
-            outputBuffer.GetData(newHeadings);
-            outputBuffer.Dispose();
+            var newHeadings = new NativeArray<Vector3>(_BoidData.Count, Allocator.TempJob);
+            outputBuffer.GetData(_GPUDataReadArray, 0, 0, _BoidData.Count);
+            newHeadings.CopyFrom(_GPUDataReadArray);
 
-            for (var i = 0; i < _Boids.Count; i++)
-            {
-                _Boids[i] = new Boid(_Boids[i].Transform, newHeadings[i]);
-                _Boids[i].Transform.localRotation = Quaternion.LookRotation(newHeadings[i], Vector3.up);
-            }
+            outputBuffer.Dispose();
+            
+            UpdateBoidData(newHeadings);
         }
 
-        struct MoveBoidsJob : IJobParallelForTransform
+        
+        private unsafe struct BoidTransformJob : IJobParallelForTransform
         {
-            [ReadOnly] public NativeArray<Boid> boids;
-            [ReadOnly] public float deltaSpeed;
-
+            public NativeArray<Vector3> Headings;
+            public float DeltaSpeed;
+            [NativeDisableUnsafePtrRestriction]
+            public BoidData* Data;
+            
             public void Execute(int index, TransformAccess transform)
             {
-                // transform
+                transform.localRotation = Quaternion.LookRotation(Headings[index], Vector3.up);
+                Data[index].Heading = (transform.rotation * Vector3.forward);
+                transform.localPosition += Data[index].Heading * DeltaSpeed;
+                Data[index].Position = transform.position;
             }
         }
         
-        private void DoBoidMove()
+        private unsafe void UpdateBoidData(in NativeArray<Vector3> headings)
         {
-            // var taa = new TransformAccessArray()
-            // var job = new MoveBoidsJob();
-            // job.boids.CopyFrom(_Boids.ToArray());
-            // job.Schedule()
-            float deltaSpeed = BoidSpeed * Time.fixedDeltaTime;
-            for (var i = 0; i < _Boids.Count; i++)
+            var jobStruct = new BoidTransformJob()
             {
-                _Boids[i].Transform.localPosition += _Boids[i].Heading * deltaSpeed;
-            }
+                Headings = headings,
+                Data = (BoidData*)_BoidData.GetPointer(),
+                DeltaSpeed = BoidSpeed * Time.fixedDeltaTime
+            };
+            var jobHandle = jobStruct.Schedule(_BoidTransforms);
+            jobHandle.Complete();
+            headings.Dispose();
         }
+        
         private void Update()
         {
-            UpdateBoidData();
-            DoBoidMove();
+            UpdateBoids();
         }
     }
 
